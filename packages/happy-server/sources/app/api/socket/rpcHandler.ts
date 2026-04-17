@@ -15,23 +15,12 @@ import { Counter, Histogram, register } from 'prom-client';
 
 const RPC_ROOM_PREFIX = 'rpc:';
 const RPC_CALL_TIMEOUT_MS = 30_000;
-const RPC_PRESENCE_POLL_MS = 1_000;
-// Timeout for cross-replica fetchSockets during initial daemon lookup and the
-// reconnect grace window. Must be long enough for the full Redis streams
-// round-trip (XADD → peer XREAD → process → XADD response → local XREAD)
-// across all replicas. The cluster-adapter default heartbeatTimeout is 10s;
-// 2s is well above typical healthy latency (~50-200ms) while still allowing
-// ~6-7 polls within the grace window.
+// Timeout for cross-replica fetchSockets during initial daemon lookup and
+// the reconnect grace window. Covers a full Redis-streams round-trip
+// (XADD → peer XREAD → process → XADD response → local XREAD).
 const RPC_LOOKUP_FETCH_TIMEOUT_MS = 2_000;
-// Timeout for in-flight presence-poll fetchSockets. Must be << RPC_CALL_TIMEOUT_MS
-// so a dead replica doesn't stall each poll for the full adapter heartbeatTimeout
-// (10s). 500ms keeps daemon-death detection responsive (~1s).
-const RPC_PRESENCE_FETCH_TIMEOUT_MS = 500;
-// How long an rpc-call waits for the daemon socket to appear in the room when
-// the room is empty at call time (e.g. brief daemon reconnect window). With
-// RPC_LOOKUP_FETCH_TIMEOUT_MS at 2s + RPC_RECONNECT_POLL_MS at 200ms, each
-// poll iteration takes ~2.2s. 15s gives ~6-7 iterations — enough to catch a
-// daemon mid-reconnect after a rolling deploy or transient network drop.
+// How long an rpc-call waits for the daemon to (re)appear in the room when
+// the room is empty at call time (brief daemon reconnect window).
 const RPC_RECONNECT_GRACE_MS = 15_000;
 const RPC_RECONNECT_POLL_MS = 200;
 
@@ -86,17 +75,17 @@ type RoomSockets = RemoteSocket<DefaultEventsMap, any>[];
 /**
  * fetchSockets(room) wrapped with a caller-specified timeout. Returns `[]`
  * and logs on failure (cluster-adapter request timeout, peer replica
- * unresponsive). Use RPC_LOOKUP_FETCH_TIMEOUT_MS for daemon lookups (initial
- * + grace window) and RPC_PRESENCE_FETCH_TIMEOUT_MS for in-flight presence
- * polling.
+ * unresponsive). NOTE: `[]` conflates "room genuinely empty" with
+ * "some peer replica didn't ACK in time" — callers must not treat it as
+ * proof the daemon is gone.
  */
-async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup'): Promise<RoomSockets> {
+async function fetchRoomSockets(io: Server, room: string, timeoutMs: number): Promise<RoomSockets> {
     try {
         return await io.in(room)
             .timeout(timeoutMs)
             .fetchSockets();
     } catch (error) {
-        rpcFetchSocketsTimeouts.inc({ context });
+        rpcFetchSocketsTimeouts.inc({ context: 'lookup' });
         log({ module: 'websocket' }, `fetchSockets failed for ${room} (timeout=${timeoutMs}ms): ${error}`);
         return [];
     }
@@ -202,42 +191,24 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 return;
             }
 
-            // 2. Single-target emit with timeout — works cross-replica via adapter.
-            //
-            // Race against a presence poll that aborts fast if the target leaves
-            // the room. WHY: emitWithAck has no idea the target socket is dead;
-            // when the daemon's pod gets killed mid-call, the cluster adapter's
-            // outgoing BROADCAST request is queued waiting for a BROADCAST_ACK
-            // that will never come, and the request only times out at the user-
-            // set RPC_CALL_TIMEOUT_MS (30s). Heartbeat-based pod liveness
-            // detection in the adapter takes ~10s and doesn't proactively
-            // cancel pending broadcasts. Polling fetchSockets is the only way
-            // to detect "the target socket is gone" and abort fast (~1s).
-            const ackPromise = target.timeout(RPC_CALL_TIMEOUT_MS)
-                .emitWithAck('rpc-request', { method, params });
-
-            let presenceAlive = true;
-            const presencePoll = (async () => {
-                while (presenceAlive) {
-                    await sleep(RPC_PRESENCE_POLL_MS);
-                    if (!presenceAlive) return;
-                    const stillThere = await fetchRoomSockets(io, room, RPC_PRESENCE_FETCH_TIMEOUT_MS, 'presence');
-                    if (!stillThere.some(s => s.id === target.id)) {
-                        throw new Error('RPC target disconnected');
-                    }
-                }
-            })();
-
+            // Trade-off note: cluster-adapter does NOT cancel pending
+            // broadcast-ack waits when a peer is declared dead by heartbeat
+            // (only customRequests are cleared in removeNode). So if the
+            // daemon's pod is killed mid-call, this rejects at
+            // RPC_CALL_TIMEOUT_MS (30s), not at the heartbeat boundary.
+            // The previous implementation polled fetchSockets every second to
+            // detect this faster (~1s), but that poll produced false-positive
+            // "target disconnected" errors whenever any peer was momentarily
+            // slow to ACK fetchSockets — far more common than a real pod kill.
             try {
-                const response = await Promise.race([ackPromise, presencePoll]);
+                const response = await target.timeout(RPC_CALL_TIMEOUT_MS)
+                    .emitWithAck('rpc-request', { method, params });
                 finish('success');
                 callback?.({ ok: true, result: response });
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : 'RPC call failed';
-                finish(errorMsg === 'RPC target disconnected' ? 'target_disconnected' : 'timeout');
+                finish('timeout');
                 callback?.({ ok: false, error: errorMsg });
-            } finally {
-                presenceAlive = false;
             }
         } catch (error) {
             finish('internal_error');
