@@ -127,7 +127,7 @@ async function waitForRoomMember(io: Server, room: string, maxMs: number, metric
 
 export function rpcHandler(userId: string, socket: Socket, io: Server) {
 
-    socket.on('rpc-register', (data: any) => {
+    socket.on('rpc-register', async (data: any) => {
         try {
             const { method } = data ?? {};
             if (!method || typeof method !== 'string') {
@@ -135,6 +135,13 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 return;
             }
             socket.join(rpcRoom(userId, method));
+            // Give the cluster adapter time to propagate the room-join event to
+            // peer replicas via Redis streams before acking. Without this, a
+            // caller on another replica that fires rpc-call immediately after
+            // receiving rpc-registered can hit either an empty fetchSockets
+            // (target not yet visible) or a stalled cross-replica emitWithAck
+            // (ack path cursor lag). 100ms covers typical healthy streams RTT.
+            await sleep(100);
             socket.emit('rpc-registered', { method });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in rpc-register: ${error}`);
